@@ -1,0 +1,312 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Metadata: 
+  AWS::CloudFormation::Interface: 
+    ParameterGroups: 
+      - 
+        Label: 
+          default: "Basic Configuration"
+        Parameters: 
+          - TagKey
+          - TagValue
+          - AlertSNSTopicArn
+      - 
+        Label: 
+          default: "CloudWatch Metric Configuration"
+        Parameters: 
+          - MetricName
+          - Statistic
+          - Period
+          - EvaluationPeriods
+          - DatapointsToAlarm
+          - ComparisonOperator
+          - Threshold
+
+Parameters:
+  TagKey:
+    Type: String
+    Description: "The tag key to filter EC2 instances"
+    Default: "Environment"
+
+  TagValue:
+    Type: String
+    Description: "The tag value to filter EC2 instances"
+    Default: "Production"
+
+  AlertSNSTopicArn:
+    Type: String
+    Description: "ARN of existing SNS Topic for alerts"
+    AllowedPattern: "arn:aws:sns:[a-z0-9-]+:[0-9]+:[a-zA-Z0-9-_]+"
+    ConstraintDescription: "Must be a valid SNS Topic ARN"
+
+  MetricName:
+    Type: String
+    Description: "The name of the metric to monitor"
+    Default: "StatusCheckFailed"
+    AllowedValues: 
+      - StatusCheckFailed
+      - CPUUtilization
+
+  Statistic:
+    Type: String
+    Description: "The statistic to apply to the alarm's metric"
+    Default: "Maximum"
+    AllowedValues:
+      - Maximum
+      - Minimum
+      - Average
+      - Sum
+      - SampleCount
+
+  Period:
+    Type: Number
+    Description: "The period in seconds over which the metric is evaluated, valid values are 10, 30, and any multiple of 60."
+    Default: 60
+    MinValue: 1
+    MaxValue: 86400
+
+  EvaluationPeriods:
+    Type: Number
+    Description: "The number of periods over which data is compared to the threshold"
+    Default: 2
+    MinValue: 1
+    MaxValue: 100
+
+  DatapointsToAlarm:
+    Type: Number
+    Description: "The number of datapoints that must be breaching to trigger the alarm"
+    Default: 2
+    MinValue: 1
+    MaxValue: 100
+
+  ComparisonOperator:
+    Type: String
+    Description: "The arithmetic operation to use when comparing the specified statistic and threshold"
+    Default: "GreaterThanThreshold"
+    AllowedValues:
+      - GreaterThanThreshold
+      - GreaterThanOrEqualToThreshold
+      - LessThanThreshold
+      - LessThanOrEqualToThreshold
+      - LessThanLowerOrGreaterThanUpperThreshold
+      - LessThanLowerThreshold
+      - GreaterThanUpperThreshold
+
+  Threshold:
+    Type: Number
+    Description: "The value against which the metric is compared"
+    Default: 0
+
+Resources:
+  AlarmCreatorFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import cfnresponse
+
+          def create_alarm_for_instance(cloudwatch, instance_id, sns_topic):
+              try:
+                  cloudwatch.put_metric_alarm(
+                      AlarmName=f'{os.environ["METRIC_NAME"]}-{instance_id}',
+                      AlarmDescription=f'{os.environ["METRIC_NAME"]} alarm for EC2 instance {instance_id}',
+                      MetricName=os.environ['METRIC_NAME'],
+                      Namespace='AWS/EC2',
+                      Statistic=os.environ['STATISTIC'],
+                      Dimensions=[
+                          {
+                              'Name': 'InstanceId',
+                              'Value': instance_id
+                          }
+                      ],
+                      Period=int(os.environ['PERIOD']),
+                      EvaluationPeriods=int(os.environ['EVALUATION_PERIODS']),
+                      DatapointsToAlarm=int(os.environ['DATAPOINTS_TO_ALARM']),
+                      Threshold=float(os.environ['THRESHOLD']),
+                      ComparisonOperator=os.environ['COMPARISON_OPERATOR'],
+                      AlarmActions=[sns_topic]
+                  )
+                  print(f"Created alarm for instance {instance_id}")
+                  return True
+              except Exception as e:
+                  print(f"Error creating alarm for instance {instance_id}: {str(e)}")
+                  return False
+
+          def delete_alarm_for_instance(cloudwatch, instance_id):
+              try:
+                  cloudwatch.delete_alarms(
+                      AlarmNames=[f'{os.environ["METRIC_NAME"]}-{instance_id}']
+                  )
+                  print(f"Deleted alarm for instance {instance_id}")
+                  return True
+              except Exception as e:
+                  print(f"Error deleting alarm for instance {instance_id}: {str(e)}")
+                  return False
+
+          def get_tagged_instances():
+              ec2 = boto3.client('ec2')
+              paginator = ec2.get_paginator('describe_instances')
+              instances = []
+              
+              tag_key = os.environ['TAG_KEY']
+              tag_value = os.environ['TAG_VALUE']
+              
+              try:
+                  for page in paginator.paginate(
+                      Filters=[
+                          {
+                              'Name': f'tag:{tag_key}',
+                              'Values': [tag_value]
+                          },
+                          {
+                              'Name': 'instance-state-name',
+                              'Values': ['running', 'pending']
+                          }
+                      ]
+                  ):
+                      for reservation in page['Reservations']:
+                          for instance in reservation['Instances']:
+                              instances.append(instance['InstanceId'])
+                  return instances
+              except Exception as e:
+                  print(f"Error getting tagged instances: {str(e)}")
+                  return []
+
+          def lambda_handler(event, context):
+              if 'RequestType' in event:
+                  try:
+                      cloudwatch = boto3.client('cloudwatch')
+                      sns_topic = os.environ['SNS_TOPIC_ARN']
+                      
+                      if event['RequestType'] in ['Create', 'Update']:
+                          instances = get_tagged_instances()
+                          for instance_id in instances:
+                              create_alarm_for_instance(cloudwatch, instance_id, sns_topic)
+                          
+                          cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                              'InstanceCount': len(instances)
+                          })
+                          
+                      elif event['RequestType'] == 'Delete':
+                          instances = get_tagged_instances()
+                          for instance_id in instances:
+                              delete_alarm_for_instance(cloudwatch, instance_id)
+                          
+                          cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                          
+                  except Exception as e:
+                      print(f"Error in custom resource handler: {str(e)}")
+                      cfnresponse.send(event, context, cfnresponse.FAILED, {})
+                  
+                  return
+
+              # 处理 EC2 实例状态变化事件
+              if 'detail' in event and 'instance-id' in event['detail']:
+                  instance_id = event['detail']['instance-id']
+                  state = event['detail']['state']
+                  
+                  ec2 = boto3.client('ec2')
+                  response = ec2.describe_instances(InstanceIds=[instance_id])
+                  
+                  # 检查实例是否有匹配的标签
+                  for reservation in response['Reservations']:
+                      for instance in reservation['Instances']:
+                          tags = instance.get('Tags', [])
+                          for tag in tags:
+                              if (tag['Key'] == os.environ['TAG_KEY'] and 
+                                  tag['Value'] == os.environ['TAG_VALUE']):
+                                  
+                                  cloudwatch = boto3.client('cloudwatch')
+                                  if state == 'running':
+                                      create_alarm_for_instance(
+                                          cloudwatch, 
+                                          instance_id, 
+                                          os.environ['SNS_TOPIC_ARN']
+                                      )
+                                  elif state in ['terminated', 'stopped']:
+                                      delete_alarm_for_instance(cloudwatch, instance_id)
+                  
+              return {
+                  'statusCode': 200,
+                  'body': 'Processing completed'
+              }
+
+      Runtime: python3.10
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref AlertSNSTopicArn
+          TAG_KEY: !Ref TagKey
+          TAG_VALUE: !Ref TagValue
+          METRIC_NAME: !Ref MetricName
+          STATISTIC: !Ref Statistic
+          PERIOD: !Ref Period
+          EVALUATION_PERIODS: !Ref EvaluationPeriods
+          DATAPOINTS_TO_ALARM: !Ref DatapointsToAlarm
+          COMPARISON_OPERATOR: !Ref ComparisonOperator
+          THRESHOLD: !Ref Threshold
+      Timeout: 300
+
+  # Custom Resource 触发初始化
+  InitializeAlarms:
+    Type: 'Custom::InitializeAlarms'
+    Properties:
+      ServiceToken: !GetAtt AlarmCreatorFunction.Arn
+      Version: '1.0'
+
+  # EventBridge 规则：监控 EC2 实例状态变化
+  EC2StateChangeRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Description: "Monitor EC2 instance state changes"
+      EventPattern:
+        source:
+          - "aws.ec2"
+        detail-type:
+          - "EC2 Instance State-change Notification"
+      State: "ENABLED"
+      Targets:
+        - Arn: !GetAtt AlarmCreatorFunction.Arn
+          Id: "AlarmCreatorTarget"
+
+  # Lambda 权限
+  LambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !Ref AlarmCreatorFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: 'events.amazonaws.com'
+      SourceArn: !GetAtt EC2StateChangeRule.Arn
+
+  # Lambda 执行角色
+  LambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: EC2AndCloudWatchAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'cloudwatch:PutMetricAlarm'
+                  - 'cloudwatch:DeleteAlarms'
+                  - 'ec2:DescribeInstances'
+                Resource: '*'
+
+Outputs:
+  LambdaFunctionARN:
+    Description: "ARN of the Lambda Function"
+    Value: !GetAtt AlarmCreatorFunction.Arn
